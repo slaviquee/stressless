@@ -409,3 +409,38 @@ async def test_cma_tee_consumer_break_is_not_failure(monkeypatch) -> None:
     handle = persisted[1]
     assert handle.status == "succeeded", (handle.status, handle.error)
     assert handle.stop_subtype == "end_turn"
+
+
+# --- continuous judge (offline; stub pool + fake client) ---
+
+class _StubPool:
+    def __init__(self, rows):
+        self._rows = rows
+        self.executes: list[tuple] = []
+
+    async def fetch(self, *_args, **_kw):
+        return self._rows
+
+    async def execute(self, *args):
+        self.executes.append(args)
+
+
+async def test_judge_recent_judges_failures_and_writes_scores() -> None:
+    from stressless import judge
+
+    rows = [
+        {"id": "r1", "agent_kind": "prefilter", "status": "failed",
+         "request": {"messages": [{"role": "user", "content": "Acme AI raises $5M"}]},
+         "response": '{"relevant": true, "confidence": 0.9}'},
+        {"id": "r2", "agent_kind": "unrubriced_kind", "status": "failed",
+         "request": {"messages": []}, "response": "x"},
+    ]
+    pool = _StubPool(rows)
+    client = _FakeClient('{"reasoning": "evidence supports keep", "verdict": "correct"}')
+    summary = await judge.judge_recent(pool, client, days=1, sample_rate=0.0, limit=10)
+
+    assert summary["judged"] == 1  # failure judged; un-rubric'd kind skipped
+    assert summary["by_kind"]["prefilter"]["correct"] == 1
+    # one scores INSERT for r1
+    score_inserts = [e for e in pool.executes if "INSERT INTO stressless.scores" in e[0]]
+    assert len(score_inserts) == 1 and score_inserts[0][1] == "r1"

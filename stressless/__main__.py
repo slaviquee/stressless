@@ -155,6 +155,83 @@ async def _ingest_cma(session_ids: list[str], ingest_all: bool, kind: str | None
     await store.close_pool()
 
 
+async def _judge(days: int, sample: float, limit: int) -> None:
+    import json
+
+    import anthropic
+
+    from . import store, wrap_anthropic
+    from .judge import judge_recent
+
+    client = wrap_anthropic(anthropic.AsyncAnthropic(), kind="judge")
+    pool = await store.get_pool()
+    summary = await judge_recent(pool, client, days=days, sample_rate=sample, limit=limit)
+    print(json.dumps(summary, indent=2))
+    await asyncio.sleep(0.5)
+    await store.close_pool()
+
+
+async def _init() -> None:
+    await _init_db()
+    print("""
+Integration (pick what matches your stack):
+
+  Claude Agent SDK — tee the query stream once at your call site:
+      async for message in stressless.tee_query_stream(query(prompt=..., options=...)): ...
+  Label logical jobs (repairs/subagents attach automatically):
+      async with stressless.run("my_agent", ref=job_id, budget_usd=3.0): ...
+
+  Raw Anthropic API:
+      client = stressless.wrap_anthropic(AsyncAnthropic(), kind="classifier")
+
+  Managed Agents (CMA):
+      async for ev in stressless.tee_session_stream(stream, kind="researcher", session_id=sid): ...
+      python -m stressless ingest-cma <session_id|--all>
+
+Then:
+      python -m stressless report --days 7      # spend, latency, failures, cache
+      python -m stressless rules  --days 7      # deterministic findings (cron-able)
+      python -m stressless judge  --days 1      # sampled LLM judge (cron-able)
+Dashboard:  from stressless.web import router; app.include_router(router)  ->  /stressless
+Env:        STRESSLESS_ENABLED=0 kill switch · STRESSLESS_CAPTURE_PROMPTS=0 sizes/SHAs only
+""")
+
+
+async def _dataset_add_run(run_id: str, dataset: str, split: str, tier: str) -> None:
+    from . import store
+
+    pool = await store.get_pool()
+    run = await pool.fetchrow("SELECT * FROM stressless.runs WHERE id = $1::uuid", run_id)
+    if run is None:
+        print(f"run {run_id} not found")
+        return
+    steps = await pool.fetch(
+        "SELECT kind, name, tool_use_id, input, output, is_error FROM stressless.steps"
+        " WHERE run_id = $1::uuid ORDER BY idx", run_id,
+    )
+    cassette = [dict(s) for s in steps if s["kind"] in ("tool", "tool_result")]
+    llm = next((dict(s) for s in steps if s["kind"] == "llm"), None)
+    dataset_id = await pool.fetchval(
+        """INSERT INTO stressless.datasets (agent_kind, name)
+           VALUES ($1, $2)
+           ON CONFLICT (agent_kind, name) DO UPDATE SET name = EXCLUDED.name
+           RETURNING id""",
+        run["agent_kind"], dataset,
+    )
+    await pool.execute(
+        """INSERT INTO stressless.dataset_items
+             (dataset_id, input, expected, source_run_id, split, tier, cassette)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+        dataset_id,
+        {"meta": run["meta"], "request": (llm or {}).get("input"), "ref": run["external_ref"]},
+        {"outcome": run["outcome"], "status": run["status"],
+         "result": (run["tracecard"] or {}).get("result")},
+        run["id"], split, tier, cassette or None,
+    )
+    print(f"run {run_id} -> dataset '{dataset}' ({split}/{tier}, cassette steps: {len(cassette)})")
+    await store.close_pool()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="stressless")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -169,6 +246,19 @@ def main() -> None:
 
     report_parser = sub.add_parser("report", help="print the cost/quality report")
     report_parser.add_argument("--days", type=int, default=7)
+
+    judge_parser = sub.add_parser("judge", help="LLM-judge recent runs (failures 100%, successes sampled)")
+    judge_parser.add_argument("--days", type=int, default=1)
+    judge_parser.add_argument("--sample", type=float, default=0.10)
+    judge_parser.add_argument("--limit", type=int, default=50)
+
+    init_parser = sub.add_parser("init", help="apply the schema and print the integration guide")
+
+    add_run_parser = sub.add_parser("dataset-add-run", help="harvest a run into a dataset (with tool cassette)")
+    add_run_parser.add_argument("run_id")
+    add_run_parser.add_argument("--dataset", required=True)
+    add_run_parser.add_argument("--split", default="dev", choices=["dev", "holdout"])
+    add_run_parser.add_argument("--tier", default="capability", choices=["capability", "regression"])
 
     ingest_parser = sub.add_parser("ingest-cma", help="ingest Managed Agents sessions by id (or --all)")
     ingest_parser.add_argument("session_ids", nargs="*")
@@ -187,6 +277,12 @@ def main() -> None:
         asyncio.run(_rules(args.days))
     elif args.command == "report":
         asyncio.run(_report(args.days))
+    elif args.command == "judge":
+        asyncio.run(_judge(args.days, args.sample, args.limit))
+    elif args.command == "init":
+        asyncio.run(_init())
+    elif args.command == "dataset-add-run":
+        asyncio.run(_dataset_add_run(args.run_id, args.dataset, args.split, args.tier))
     elif args.command == "ingest-cma":
         asyncio.run(_ingest_cma(args.session_ids, args.all, args.kind))
     elif args.command == "smoke":

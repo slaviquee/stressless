@@ -56,9 +56,27 @@ Then:
 
 ```bash
 python -m stressless report --days 7   # spend by agent kind, p50/p95, fail %, cache hit %
-python -m stressless rules --days 7    # rule packs -> scores + findings
+python -m stressless rules --days 7    # rule packs -> scores + findings (cron-able)
+python -m stressless judge --days 1    # LLM judge: failures 100%, successes sampled (cron-able)
 python -m stressless smoke             # synthetic end-to-end check (--live adds one tiny Haiku call)
+python -m stressless dataset-add-run <run_id> --dataset golden   # harvest run + tool cassette
 ```
+
+New install? `python -m stressless init` applies the schema and prints this whole guide.
+
+### Continuous LLM judge
+
+`stressless judge` grades recent captured calls against per-kind rubrics
+(`stressless.judge.RUBRICS` — add your own): all failures, plus a sample of
+successes (default 10%). Reasoning-before-verdict, binary verdicts with an
+`unknown` escape, a stronger-tier judge model by default
+(`STRESSLESS_JUDGE_MODEL`, default Opus), and every verdict stored in
+`stressless.scores (source='judge')` with the judge's own calls recorded under
+`kind=judge`. A high incorrect-rate auto-opens a finding. Judges are advisory
+until you've checked their alignment against your own labels — they corroborate
+the deterministic gates, not replace them. Request prompts are captured
+truncated for judging; set `STRESSLESS_CAPTURE_PROMPTS=0` to store sizes/SHAs
+only.
 
 Dashboard (mount into any FastAPI app; served localhost-only):
 
@@ -107,7 +125,19 @@ and flagged. Live example: `examples/cma_live_proof.py` (one Haiku session, <$0.
 
 ## Status & roadmap
 
-v0.1 — the **Watch** loop plus the first slice of **Judge** (rule packs + findings), running in production. Next, in order: sampled LLM-as-judge rubrics with human-alignment gating, golden datasets harvested from production runs, cassette replay (record tool results, re-run the real agent offline in CI), and the **Improve** loop — a nightly agent that turns findings into replay-verified, evidence-bearing pull requests. The ladder tops out at "open a PR": never auto-merge, never intercept live runs.
+v0.2 — **Watch** (Agent SDK + raw API + Managed Agents) and **Judge** (rule
+packs + findings, plus the sampled LLM judge with rubrics) running in
+production; datasets harvested from real runs with tool cassettes attached;
+experiments + proposals rendered as improvement-loop stories on the dashboard.
+Proven end to end on a production deployment: a replay-verified model-routing
+change shipped as an evidence-bearing PR (−65% cost at quality parity), and a
+cache hypothesis was refuted by measurement — no PR, gate held.
+
+Next: cassette *replay* (re-run the real agent offline in CI against recorded
+tool results), judge↔human alignment gating (κ before a judge may gate),
+and the **Improve** loop — a nightly agent that turns findings into
+replay-verified PRs automatically. The ladder tops out at "open a PR": never
+auto-merge, never intercept live runs.
 
 ## License
 

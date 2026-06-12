@@ -1,6 +1,9 @@
 """Wrap a raw (Async)Anthropic client so every messages.create lands in stressless.runs.
 
-Each non-streaming call becomes one run of the given kind with cache-aware cost.
+Each non-streaming call becomes one run of the given kind with cache-aware cost,
+plus one `llm` step holding the truncated request messages and response text —
+that captured input is what the sampled judge grades later. Set
+STRESSLESS_CAPTURE_PROMPTS=0 to record sizes/SHAs only (PII-sensitive hosts).
 Streaming calls pass through unrecorded (no host call site uses them today).
 """
 
@@ -8,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -51,17 +55,11 @@ def wrap_anthropic(
             try:
                 response = await original(*args, **kwargs)
             except BaseException as exc:
-                store.fire(
-                    store.insert_run_complete(
-                        _run_row(kind, ref, meta, kwargs, None, exc, started, created_at, mode)
-                    )
-                )
+                row = _run_row(kind, ref, meta, kwargs, None, exc, started, created_at, mode)
+                store.fire(store.insert_run_complete(row, _llm_steps(row, kwargs, None)))
                 raise
-            store.fire(
-                store.insert_run_complete(
-                    _run_row(kind, ref, meta, kwargs, response, None, started, created_at, mode)
-                )
-            )
+            row = _run_row(kind, ref, meta, kwargs, response, None, started, created_at, mode)
+            store.fire(store.insert_run_complete(row, _llm_steps(row, kwargs, response)))
             return response
 
         create._stressless_wrapped = True  # type: ignore[attr-defined]
@@ -153,3 +151,30 @@ def _run_row(
         "created_at": created_at,
         "finished_at": datetime.now(timezone.utc),
     }
+
+
+def _llm_steps(row: dict[str, Any], kwargs: dict[str, Any], response: Any) -> list[tuple]:
+    """One `llm` step per call: request messages in, response text out."""
+    capture = os.environ.get("STRESSLESS_CAPTURE_PROMPTS", "1").strip().lower() not in {
+        "0", "false", "no", "off"
+    }
+    request: dict[str, Any] = {}
+    if kwargs.get("system") is not None:
+        request["system"] = kwargs["system"]
+    request["messages"] = kwargs.get("messages")
+    input_payload, input_sha, input_bytes = store.pack_payload(request)
+    output_text = None
+    if response is not None:
+        output_text = "\n".join(
+            text for text in (
+                getattr(block, "text", None) for block in (getattr(response, "content", None) or [])
+            ) if text
+        ) or None
+    output_payload, output_sha, output_bytes = store.pack_payload(output_text)
+    return [(
+        row["id"], 0, "llm", kwargs.get("model"), None,
+        input_payload if capture else None,
+        output_payload if capture else None,
+        input_sha, output_sha, input_bytes, output_bytes,
+        row["status"] == "failed", row.get("duration_ms"), None, row["created_at"],
+    )]

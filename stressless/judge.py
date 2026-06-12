@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 from dataclasses import dataclass
 from typing import Any
 
@@ -167,3 +168,111 @@ async def record_score(
            VALUES ($1, $2, $3, 'judge', 'categorical', $4, $5, $6)""",
         run_id, step_id, name, verdict.label, verdict.reasoning[:2000], verdict.judge_model,
     )
+
+
+def rubric_for(agent_kind: str) -> str | None:
+    if agent_kind in RUBRICS:
+        return RUBRICS[agent_kind]
+    base = agent_kind.split("_experiment")[0].split(":")[0]
+    return RUBRICS.get(base)
+
+
+async def judge_response(
+    client: Any,
+    *,
+    agent_kind: str,
+    request: Any,
+    response_text: str,
+    judge_model: str = DEFAULT_JUDGE_MODEL,
+) -> Verdict:
+    """Grade one captured call: given the request the agent saw and the response
+    it produced, was the decision correct? Generic over any rubric'd kind."""
+    system = rubric_for(agent_kind) or RUBRICS["prefilter"]
+    request_text = request if isinstance(request, str) else json.dumps(
+        request, ensure_ascii=False, default=str
+    )
+    user = (
+        f"REQUEST the agent received:\n{request_text[:6000]}\n\n"
+        f"RESPONSE the agent produced:\n{response_text[:2000]}\n\n"
+        "First reason step by step about whether the response's decision is "
+        "correct given the request's evidence and the rubric. Then return your "
+        "verdict. Use 'unknown' only if the request is too sparse to judge."
+    )
+    data = await _ask(client, model=judge_model, system=system, user=user, schema=POINTWISE_SCHEMA)
+    return Verdict(
+        label=str(data.get("verdict", "unknown")),
+        reasoning=str(data.get("reasoning", "")),
+        judge_model=judge_model,
+    )
+
+
+async def judge_recent(
+    pool: Any,
+    client: Any,
+    *,
+    days: int = 1,
+    sample_rate: float = 0.10,
+    limit: int = 50,
+    judge_model: str = DEFAULT_JUDGE_MODEL,
+    rng: random.Random | None = None,
+) -> dict[str, Any]:
+    """Continuous Judge layer 2: judge all recent failures + a sample of
+    successes for every rubric'd agent kind, skipping runs already judged.
+    Designed for cron: ``python -m stressless judge``."""
+    from datetime import timedelta
+
+    rng = rng or random.Random()
+    rows = await pool.fetch(
+        """
+        SELECT r.id, r.agent_kind, r.status, s.input AS request, s.output AS response
+        FROM stressless.runs r
+        JOIN stressless.steps s ON s.run_id = r.id AND s.kind = 'llm' AND s.input IS NOT NULL
+        WHERE r.created_at > now() - $1::interval
+          AND r.agent_kind <> 'judge'
+          AND NOT EXISTS (SELECT 1 FROM stressless.scores sc
+                          WHERE sc.run_id = r.id AND sc.source = 'judge')
+        ORDER BY r.created_at DESC
+        LIMIT $2
+        """,
+        timedelta(days=days), limit * 4,
+    )
+    picked = []
+    for row in rows:
+        if rubric_for(row["agent_kind"]) is None:
+            continue
+        if row["status"] != "succeeded" or rng.random() < sample_rate:
+            picked.append(row)
+        if len(picked) >= limit:
+            break
+
+    counts: dict[str, dict[str, int]] = {}
+    for row in picked:
+        response_text = row["response"] if isinstance(row["response"], str) else json.dumps(
+            row["response"], ensure_ascii=False, default=str
+        )
+        verdict = await judge_response(
+            client, agent_kind=row["agent_kind"], request=row["request"],
+            response_text=response_text or "", judge_model=judge_model,
+        )
+        await record_score(
+            pool, run_id=row["id"], name=f"{row['agent_kind']}_correct", verdict=verdict
+        )
+        bucket = counts.setdefault(row["agent_kind"], {"correct": 0, "incorrect": 0, "unknown": 0})
+        bucket[verdict.label if verdict.label in bucket else "unknown"] += 1
+
+    for kind, bucket in counts.items():
+        graded = bucket["correct"] + bucket["incorrect"]
+        if bucket["incorrect"] >= 3 and graded and bucket["incorrect"] / graded > 0.10:
+            await pool.execute(
+                """INSERT INTO stressless.findings
+                     (fingerprint, kind, agent_kind, title, detail, severity, occurrences)
+                   VALUES ($1, 'failure_cluster', $2, $3, $4, 'high', $5)
+                   ON CONFLICT (fingerprint) DO UPDATE SET
+                     title = EXCLUDED.title, detail = EXCLUDED.detail,
+                     occurrences = EXCLUDED.occurrences, last_seen = now()""",
+                f"judge_quality:{kind}", kind,
+                f"{kind}: LLM judge marked {bucket['incorrect']}/{graded} recent decisions incorrect",
+                {"window_days": days, "judge_model": judge_model, **bucket},
+                bucket["incorrect"],
+            )
+    return {"judged": len(picked), "by_kind": counts}

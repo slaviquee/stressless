@@ -151,7 +151,22 @@ def experiment_digest(summary: Any) -> str:
         parts.append(
             f"cross-variant agreement {summary['cross_variant_decision_agreement']}"
         )
-    return " · ".join(parts)[:400]
+    if summary.get("pointwise_correctness"):
+        for model, stats in summary["pointwise_correctness"].items():
+            parts.append(
+                f"{model} judged correct {stats.get('correct_pct')}% "
+                f"({stats.get('correct')}✓/{stats.get('incorrect')}✗/{stats.get('unknown')}?)"
+            )
+    if summary.get("pairwise_on_disagreements") is not None:
+        pw = summary["pairwise_on_disagreements"]
+        if pw:
+            parts.append(
+                f"{summary.get('disagreements', '?')} disagreements → "
+                + ", ".join(f"{k} {v}" for k, v in pw.items())
+            )
+    if summary.get("judge_model"):
+        parts.append(f"judge {summary['judge_model']}")
+    return " · ".join(parts)[:600]
 
 
 def _cache_pct(row: dict[str, Any]) -> str:

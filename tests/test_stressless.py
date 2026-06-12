@@ -243,3 +243,71 @@ def test_backfill_parses_all_three_generations(tmp_path: Path) -> None:
     # Idempotent ids: re-parsing yields identical run ids.
     runs2, _ = parse_trace_file(trace)
     assert [r["id"] for r in runs] == [r["id"] for r in runs2]
+
+
+# --- LLM judge (offline; fake client, no network) ---
+
+class _FakeContent:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _FakeResponse:
+    def __init__(self, text: str) -> None:
+        self.content = [_FakeContent(text)]
+        self.usage = type("U", (), {"input_tokens": 10, "output_tokens": 5,
+                                    "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0})()
+        self.stop_reason = "end_turn"
+
+
+class _FakeMessages:
+    def __init__(self, payload: str) -> None:
+        self._payload = payload
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return _FakeResponse(self._payload)
+
+
+class _FakeClient:
+    def __init__(self, payload: str) -> None:
+        self.messages = _FakeMessages(payload)
+
+
+async def test_judge_pointwise_parses_verdict() -> None:
+    from stressless import judge
+
+    client = _FakeClient('{"reasoning": "concrete funding event for an AI startup", "verdict": "correct"}')
+    v = await judge.judge_pointwise(
+        client, agent_kind="prefilter",
+        item={"source": "rss", "title": "Acme AI raises $20M", "raw_text": "Series A led by X"},
+        decision_label="KEEP", judge_model="claude-opus-4-8",
+    )
+    assert v.label == "correct"
+    assert "AI startup" in v.reasoning
+    # rubric + structured-output schema were sent
+    sent = client.messages.calls[0]
+    assert sent["model"] == "claude-opus-4-8"
+    assert sent["output_config"]["format"]["schema"]["properties"]["verdict"]["enum"] == [
+        "correct", "incorrect", "unknown"]
+
+
+async def test_judge_pairwise_and_unparseable_escape() -> None:
+    from stressless import judge
+
+    client = _FakeClient('{"reasoning": "B keeps a real signal", "verdict": "B"}')
+    v = await judge.judge_pairwise(
+        client, agent_kind="prefilter",
+        item={"source": "x", "title": "thread", "raw_text": "..."},
+        option_a="DROP", option_b="KEEP",
+    )
+    assert v.label == "B"
+
+    # Non-JSON judge output must fall back to 'unknown', never raise.
+    bad = _FakeClient("the model rambled without json")
+    v2 = await judge.judge_pointwise(
+        bad, agent_kind="prefilter", item={"source": "rss", "title": "x", "raw_text": "y"},
+        decision_label="DROP",
+    )
+    assert v2.label == "unknown"

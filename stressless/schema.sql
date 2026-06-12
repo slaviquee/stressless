@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS stressless.experiments (
   baseline_experiment_id UUID REFERENCES stressless.experiments(id),
   status TEXT NOT NULL DEFAULT 'running',
   summary JSONB,
+  conclusion TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

@@ -63,9 +63,9 @@ async def gather(days: int = 7) -> dict[str, Any]:
 
     findings = await pool.fetch(
         """
-        SELECT kind, agent_kind, title, severity, occurrences, est_impact, last_seen
+        SELECT kind, agent_kind, title, severity, status, occurrences, est_impact, last_seen
         FROM stressless.findings
-        WHERE status = 'open'
+        WHERE status IN ('open', 'proposed', 'pr_open')
         ORDER BY CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1
                  WHEN 'low' THEN 2 ELSE 3 END, occurrences DESC
         LIMIT 20
@@ -81,27 +81,6 @@ async def gather(days: int = 7) -> dict[str, Any]:
         """
     )
 
-    experiments = await pool.fetch(
-        """
-        SELECT e.id, e.name, e.status, e.trials_per_item, e.summary, e.created_at,
-               d.name AS dataset, (SELECT count(*) FROM stressless.dataset_items i
-                                   WHERE i.dataset_id = e.dataset_id) AS items
-        FROM stressless.experiments e
-        JOIN stressless.datasets d ON d.id = e.dataset_id
-        ORDER BY e.created_at DESC LIMIT 10
-        """
-    )
-
-    proposals = await pool.fetch(
-        """
-        SELECT p.category, p.patch_summary, p.pr_url, p.pr_state, p.created_at,
-               f.title AS finding_title
-        FROM stressless.proposals p
-        LEFT JOIN stressless.findings f ON f.id = p.finding_id
-        ORDER BY p.created_at DESC LIMIT 10
-        """
-    )
-
     return {
         "days": days,
         "by_kind": [dict(row) for row in by_kind],
@@ -109,9 +88,113 @@ async def gather(days: int = 7) -> dict[str, Any]:
         "by_source": [dict(row) for row in by_source],
         "findings": [dict(row) for row in findings],
         "recent": [dict(row) for row in recent],
-        "experiments": [dict(row) for row in experiments],
-        "proposals": [dict(row) for row in proposals],
+        "stories": await gather_stories(pool),
     }
+
+
+async def gather_stories(pool: Any) -> list[dict[str, Any]]:
+    """Thread the improvement loop into stories: finding -> experiments ->
+    conclusion -> action (PR opened / none). Experiments on the same dataset
+    belong to one investigation; proposals attach via their experiment."""
+    experiments = await pool.fetch(
+        """
+        SELECT e.id, e.name, e.status, e.summary, e.conclusion, e.created_at,
+               e.trials_per_item, d.id AS dataset_id, d.name AS dataset,
+               (SELECT count(*) FROM stressless.dataset_items i
+                WHERE i.dataset_id = d.id) AS items
+        FROM stressless.experiments e
+        JOIN stressless.datasets d ON d.id = e.dataset_id
+        ORDER BY e.created_at
+        """
+    )
+    proposals = await pool.fetch(
+        """
+        SELECT p.id, p.category, p.patch_summary, p.pr_url, p.pr_state,
+               p.created_at, p.experiment_id,
+               f.title AS finding_title, f.severity, f.first_seen,
+               f.est_impact, f.status AS finding_status
+        FROM stressless.proposals p
+        LEFT JOIN stressless.findings f ON f.id = p.finding_id
+        ORDER BY p.created_at
+        """
+    )
+
+    threads: dict[Any, dict[str, Any]] = {}
+    experiment_thread: dict[Any, Any] = {}
+    for row in experiments:
+        thread = threads.setdefault(
+            row["dataset_id"],
+            {"dataset": row["dataset"], "title": None, "finding": None,
+             "experiments": [], "proposals": [], "started": row["created_at"]},
+        )
+        experiment = dict(row)
+        # An experiment may use a subset of its dataset — the summary knows.
+        if isinstance(experiment.get("summary"), dict) and experiment["summary"].get("items"):
+            experiment["items"] = experiment["summary"]["items"]
+        thread["experiments"].append(experiment)
+        experiment_thread[row["id"]] = row["dataset_id"]
+
+    orphans: list[dict[str, Any]] = []
+    for row in proposals:
+        thread_key = experiment_thread.get(row["experiment_id"])
+        if thread_key is None:
+            orphans.append(dict(row))
+            continue
+        thread = threads[thread_key]
+        thread["proposals"].append(dict(row))
+        if row["finding_title"] and thread["finding"] is None:
+            thread["finding"] = {
+                "title": row["finding_title"],
+                "severity": row["severity"],
+                "first_seen": row["first_seen"],
+                "est_impact": row["est_impact"],
+                "status": row["finding_status"],
+            }
+
+    stories: list[dict[str, Any]] = []
+    for thread in threads.values():
+        if thread["finding"]:
+            thread["title"] = thread["finding"]["title"]
+        else:
+            thread["title"] = thread["experiments"][0]["name"]
+        done = all(e["status"] == "done" for e in thread["experiments"])
+        if thread["proposals"]:
+            last = thread["proposals"][-1]
+            thread["action"] = {
+                "kind": "pr",
+                "state": last["pr_state"],
+                "url": last["pr_url"],
+                "summary": last["patch_summary"],
+                "category": last["category"],
+            }
+        elif done:
+            refuted = any(
+                "refuted" in (e["conclusion"] or "").lower()
+                or "no win" in (e["conclusion"] or "").lower()
+                for e in thread["experiments"]
+            )
+            thread["action"] = {
+                "kind": "no_pr" if refuted else "none",
+                "summary": (
+                    "no PR — the hypothesis did not survive measurement"
+                    if refuted
+                    else "no proposal yet"
+                ),
+            }
+        else:
+            thread["action"] = {"kind": "running", "summary": "experiment running…"}
+        stories.append(thread)
+    for orphan in orphans:
+        stories.append(
+            {"dataset": None, "title": orphan["finding_title"] or orphan["patch_summary"],
+             "finding": None, "experiments": [],
+             "proposals": [orphan], "started": orphan["created_at"],
+             "action": {"kind": "pr", "state": orphan["pr_state"],
+                        "url": orphan["pr_url"], "summary": orphan["patch_summary"],
+                        "category": orphan["category"]}}
+        )
+    stories.sort(key=lambda s: s["started"], reverse=True)
+    return stories
 
 
 def _fmt_usd(value: Any) -> str:
@@ -216,24 +299,33 @@ def format_text(data: dict[str, Any]) -> str:
             )
         lines.append("")
 
-    if data.get("experiments"):
-        lines.append("EXPERIMENTS")
-        for row in data["experiments"]:
+    for story in data.get("stories", []):
+        if not lines or lines[-1] != "":
+            lines.append("")
+        lines.append(f"IMPROVEMENT LOOP — {story['title']}")
+        if story.get("finding"):
+            finding = story["finding"]
+            seen = finding["first_seen"].strftime("%m-%d") if finding.get("first_seen") else ""
+            lines.append(f"  {seen}  finding     [{finding.get('severity')}] {finding['title']}")
+        for experiment in story["experiments"]:
+            when = experiment["created_at"].strftime("%m-%d")
             lines.append(
-                f"  [{row['status']:<7}] {row['name']} — {row['items']} items × "
-                f"{row['trials_per_item']} trial(s) ({row['dataset']})"
+                f"  {when}  experiment  {experiment['name']} — {experiment['items']} items × "
+                f"{experiment['trials_per_item']} trial(s) [{experiment['status']}]"
             )
-            digest = experiment_digest(row["summary"])
+            digest = experiment_digest(experiment["summary"])
             if digest:
-                lines.append(f"            {digest}")
-        lines.append("")
-
-    if data.get("proposals"):
-        lines.append("PROPOSALS")
-        for row in data["proposals"]:
-            state = f" [{row['pr_state']}]" if row["pr_state"] else ""
-            url = f" {row['pr_url']}" if row["pr_url"] else ""
-            lines.append(f"  [{row['category']:<8}]{state} {row['patch_summary']}{url}")
+                lines.append(f"               {digest}")
+            if experiment.get("conclusion"):
+                lines.append(f"               ⇒ {experiment['conclusion']}")
+        action = story["action"]
+        if action["kind"] == "pr":
+            lines.append(f"  ACTION: PR [{action['state']}] {action['summary']}")
+            if action.get("url"):
+                lines.append(f"          {action['url']}")
+        else:
+            lines.append(f"  ACTION: {action['summary']}")
+    if data.get("stories"):
         lines.append("")
 
     if data["findings"]:

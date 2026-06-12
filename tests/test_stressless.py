@@ -311,3 +311,101 @@ async def test_judge_pairwise_and_unparseable_escape() -> None:
         decision_label="DROP",
     )
     assert v2.label == "unknown"
+
+
+# --- Managed Agents adapter (offline; fake events, no network) ---
+
+def _cma_events() -> list[dict]:
+    return [
+        {"type": "session.status_running", "id": "e1", "processed_at": "2026-06-12T10:00:00+00:00"},
+        {"type": "agent.tool_use", "id": "t1", "name": "web_search",
+         "input": {"query": "acme ai"}, "processed_at": "2026-06-12T10:00:01+00:00"},
+        {"type": "agent.tool_result", "tool_use_id": "t1", "content": "3 results",
+         "processed_at": "2026-06-12T10:00:04+00:00"},
+        {"type": "span.model_request_end", "is_error": False,
+         "model_usage": {"input_tokens": 3571, "output_tokens": 727,
+                         "cache_read_input_tokens": 6656, "cache_creation_input_tokens": 100},
+         "processed_at": "2026-06-12T10:00:05+00:00"},
+        {"type": "agent.message", "content": [{"type": "text", "text": "Acme raised $20M."}],
+         "processed_at": "2026-06-12T10:00:06+00:00"},
+        {"type": "span.outcome_evaluation_end", "result": "satisfied",
+         "explanation": "all criteria met", "processed_at": "2026-06-12T10:00:07+00:00"},
+        {"type": "session.status_idle", "stop_reason": {"type": "end_turn"},
+         "processed_at": "2026-06-12T10:00:08+00:00"},
+    ]
+
+
+def test_cma_handle_accumulates_session() -> None:
+    from stressless.cma import CMASessionHandle, session_run_id
+
+    handle = CMASessionHandle("cma:researcher", session_id="sesn_abc", model="claude-haiku-4-5")
+    for event in _cma_events():
+        handle.observe_event(event)
+        terminal = handle.is_terminal(event)
+    assert terminal  # last event is a terminal idle
+    handle.finish()
+
+    assert handle.id == session_run_id("sesn_abc")  # deterministic: tee+ingest upsert one row
+    assert handle.status == "succeeded"
+    assert handle.stop_subtype == "end_turn"
+    assert handle.tokens == {"input": 3571, "output": 727, "cache_read": 6656, "cache_write": 100}
+    assert handle.result_preview == "Acme raised $20M."
+    assert handle.scores == [("cma_outcome", "satisfied", "all criteria met")]
+
+    tool_steps = [s for s in handle.steps if s["kind"] == "tool"]
+    assert tool_steps[0]["name"] == "web_search"
+    assert tool_steps[0]["output"] == "3 results"
+    assert tool_steps[0]["duration_ms"] == 3000
+
+    row = handle.finish_row()
+    assert row["session_id"] == "sesn_abc"
+    assert row["cost_estimated"] is True
+    assert row["cost_usd"] == pytest.approx(
+        (3571 * 1 + 727 * 5 + 6656 * 1 * 0.1 + 100 * 1 * 1.25) / 1e6
+    )
+    assert row["duration_ms"] == 8000
+    assert row["tracecard"]["tools"] == {"web_search": 1}
+
+
+async def test_cma_tee_passthrough_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("STRESSLESS_ENABLED", "0")
+    from stressless.cma import tee_session_stream
+
+    async def stream():
+        for event in _cma_events():
+            yield event
+
+    seen = [e async for e in tee_session_stream(stream(), kind="cma")]
+    assert len(seen) == len(_cma_events())
+
+
+async def test_cma_tee_consumer_break_is_not_failure(monkeypatch) -> None:
+    """The documented drain loop breaks at the terminal event — the GeneratorExit
+    thrown into the tee must not mark the run failed."""
+    monkeypatch.setenv("STRESSLESS_ENABLED", "1")
+    from stressless import cma as cma_mod
+
+    persisted: list = []
+
+    async def fake_persist(handle):
+        persisted.append(handle)
+
+    monkeypatch.setattr(cma_mod, "_persist", fake_persist)
+    monkeypatch.setattr(cma_mod.store, "fire", lambda coro: persisted.append(coro) or None)
+
+    async def stream():
+        for event in _cma_events():
+            yield event
+
+    tee = cma_mod.tee_session_stream(stream(), kind="cma:t", session_id="sesn_x")
+    async for event in tee:
+        if cma_mod.is_terminal_event(event):
+            break
+    await tee.aclose()
+
+    # store.fire received the _persist coroutine; run it to inspect the handle
+    coro = persisted[0]
+    await coro if hasattr(coro, "__await__") else None
+    handle = persisted[1]
+    assert handle.status == "succeeded", (handle.status, handle.error)
+    assert handle.stop_subtype == "end_turn"

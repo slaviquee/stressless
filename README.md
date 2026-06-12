@@ -67,6 +67,29 @@ from stressless.web import router as stressless_router
 app.include_router(stressless_router)   # GET /stressless
 ```
 
+## Managed Agents (CMA)
+
+Anthropic-hosted agents (beta `managed-agents-2026-04-01`) are captured from the
+session **event stream** — tool use/results, per-request token usage from
+`span.model_request_end`, stop reasons, outcome-grader verdicts:
+
+```python
+# your orchestrator already holds the stream — tee it:
+stream = await client.beta.sessions.events.stream(session_id=session.id)
+async for event in stressless.tee_session_stream(stream, kind="researcher", session_id=session.id, model="claude-haiku-4-5"):
+    ...
+
+# or capture after the fact (CMA retains full event history server-side):
+await stressless.ingest_session(client, session_id)        # same run row — deterministic id
+```
+
+```bash
+python -m stressless ingest-cma <session_id> [...]   # or --all
+```
+
+CMA reports tokens, never dollars — costs are estimated from the pricing table
+and flagged. Live example: `examples/cma_live_proof.py` (one Haiku session, <$0.01).
+
 ## Design constraints
 
 - **Never blocks, never raises into the host.** All writes are fire-and-forget tasks on a dedicated 3-connection pool; payloads truncate client-side (full-payload SHA kept); storage failures log one throttled warning and drop the write. `STRESSLESS_ENABLED=0` is a hard kill switch.

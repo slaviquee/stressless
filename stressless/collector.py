@@ -486,6 +486,8 @@ async def tee_query_stream(
             except Exception:  # noqa: BLE001 — observation must never break the agent
                 logger.debug("stressless: observe_message failed", exc_info=True)
             yield message
+    except GeneratorExit:
+        raise  # consumer closed the stream early — not a run failure
     except BaseException as exc:
         error = exc
         raise

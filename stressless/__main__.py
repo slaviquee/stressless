@@ -136,6 +136,25 @@ async def _smoke(live: bool) -> None:
     await store.close_pool()
 
 
+async def _ingest_cma(session_ids: list[str], ingest_all: bool, kind: str | None) -> None:
+    import anthropic
+
+    from . import store
+    from .cma import ingest_session
+
+    client = anthropic.AsyncAnthropic()
+    if ingest_all and not session_ids:
+        sessions = await client.beta.sessions.list()
+        session_ids = [s.id for s in (getattr(sessions, "data", None) or sessions)]
+    if not session_ids:
+        print("no session ids given (pass ids or --all)")
+        return
+    for session_id in session_ids:
+        run_id = await ingest_session(client, session_id, kind=kind)
+        print(f"ingested {session_id} -> run {run_id}")
+    await store.close_pool()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="stressless")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -151,6 +170,11 @@ def main() -> None:
     report_parser = sub.add_parser("report", help="print the cost/quality report")
     report_parser.add_argument("--days", type=int, default=7)
 
+    ingest_parser = sub.add_parser("ingest-cma", help="ingest Managed Agents sessions by id (or --all)")
+    ingest_parser.add_argument("session_ids", nargs="*")
+    ingest_parser.add_argument("--all", action="store_true", help="ingest every listed session")
+    ingest_parser.add_argument("--kind", default=None)
+
     smoke_parser = sub.add_parser("smoke", help="synthetic end-to-end collector check")
     smoke_parser.add_argument("--live", action="store_true", help="also make one tiny real Haiku call")
 
@@ -163,6 +187,8 @@ def main() -> None:
         asyncio.run(_rules(args.days))
     elif args.command == "report":
         asyncio.run(_report(args.days))
+    elif args.command == "ingest-cma":
+        asyncio.run(_ingest_cma(args.session_ids, args.all, args.kind))
     elif args.command == "smoke":
         asyncio.run(_smoke(args.live))
 

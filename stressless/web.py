@@ -24,7 +24,7 @@ async def _require_localhost(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Forbidden")
 
 from . import store
-from .report import _cache_pct, _fmt_ms, _fmt_usd, gather
+from .report import _cache_pct, _fmt_ms, _fmt_usd, experiment_digest, gather
 
 router = APIRouter(prefix="/stressless", dependencies=[Depends(_require_localhost)])
 
@@ -61,6 +61,8 @@ _PAGE = """<!doctype html>
 <div class="cards">{cards}</div>
 <h2>spend by agent kind</h2>{by_kind}
 <h2>item processor by source</h2>{by_source}
+<h2>experiments</h2>{experiments}
+<h2>proposals</h2>{proposals}
 <h2>open findings</h2>{findings}
 <h2>recent runs</h2>{recent}
 <div class="sub" style="margin-top:24px">cost marked ~ is estimated from tokens ·
@@ -141,6 +143,35 @@ async def overview(days: int = 7) -> str:
         ],
     )
 
+    experiments = _table(
+        [("when", False), ("experiment", False), ("status", False),
+         ("items×trials", True), ("result", False)],
+        [
+            [
+                r["created_at"].strftime("%m-%d %H:%M"),
+                _esc(r["name"]),
+                f'<span class="{"ok" if r["status"] == "done" else "dim"}">{_esc(r["status"])}</span>',
+                f"{r['items']}×{r['trials_per_item']}",
+                f'<span style="white-space:normal">{_esc(experiment_digest(r["summary"]))}</span>',
+            ]
+            for r in data.get("experiments", [])
+        ],
+    )
+
+    proposals = _table(
+        [("category", False), ("state", False), ("proposal", False), ("pr", False)],
+        [
+            [
+                _esc(r["category"]),
+                _esc(r["pr_state"] or "—"),
+                f'<span style="white-space:normal">{_esc(r["patch_summary"])}</span>',
+                f'<a class="accent" href="{_esc(r["pr_url"])}">{_esc(r["pr_url"]).split("/")[-1] if r["pr_url"] else ""}</a>'
+                if r["pr_url"] else "—",
+            ]
+            for r in data.get("proposals", [])
+        ],
+    )
+
     findings = _table(
         [("sev", False), ("finding", False), ("n", True), ("impact", True)],
         [
@@ -180,6 +211,8 @@ async def overview(days: int = 7) -> str:
         cards=cards,
         by_kind=by_kind,
         by_source=by_source,
+        experiments=experiments,
+        proposals=proposals,
         findings=findings,
         recent=recent,
     )

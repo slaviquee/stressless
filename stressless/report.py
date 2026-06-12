@@ -81,6 +81,27 @@ async def gather(days: int = 7) -> dict[str, Any]:
         """
     )
 
+    experiments = await pool.fetch(
+        """
+        SELECT e.id, e.name, e.status, e.trials_per_item, e.summary, e.created_at,
+               d.name AS dataset, (SELECT count(*) FROM stressless.dataset_items i
+                                   WHERE i.dataset_id = e.dataset_id) AS items
+        FROM stressless.experiments e
+        JOIN stressless.datasets d ON d.id = e.dataset_id
+        ORDER BY e.created_at DESC LIMIT 10
+        """
+    )
+
+    proposals = await pool.fetch(
+        """
+        SELECT p.category, p.patch_summary, p.pr_url, p.pr_state, p.created_at,
+               f.title AS finding_title
+        FROM stressless.proposals p
+        LEFT JOIN stressless.findings f ON f.id = p.finding_id
+        ORDER BY p.created_at DESC LIMIT 10
+        """
+    )
+
     return {
         "days": days,
         "by_kind": [dict(row) for row in by_kind],
@@ -88,6 +109,8 @@ async def gather(days: int = 7) -> dict[str, Any]:
         "by_source": [dict(row) for row in by_source],
         "findings": [dict(row) for row in findings],
         "recent": [dict(row) for row in recent],
+        "experiments": [dict(row) for row in experiments],
+        "proposals": [dict(row) for row in proposals],
     }
 
 
@@ -100,6 +123,35 @@ def _fmt_ms(value: Any) -> str:
         return "—"
     seconds = float(value) / 1000
     return f"{seconds:.1f}s" if seconds < 120 else f"{seconds / 60:.1f}m"
+
+
+def experiment_digest(summary: Any) -> str:
+    """One-line human digest of an experiment summary JSONB."""
+    if not isinstance(summary, dict):
+        return ""
+    parts: list[str] = []
+    if summary.get("agreement_pct") is not None:
+        parts.append(f"agreement {summary['agreement_pct']}%")
+    if summary.get("cost_delta_pct") is not None:
+        parts.append(f"cost Δ {summary['cost_delta_pct']:+}%")
+    for model, stats in (summary.get("per_model") or {}).items():
+        short = model.split("-4-")[0].replace("claude-", "")
+        parts.append(
+            f"{short}: ${stats.get('cost_per_call_usd')}/call, "
+            f"p50 {stats.get('p50_latency_ms')}ms, "
+            f"false-skips {stats.get('false_skips_on_signal_items')}"
+        )
+    for variant, stats in (summary.get("per_variant") or {}).items():
+        parts.append(
+            f"{variant}: ${stats.get('mean_cost_usd')}/run, "
+            f"cache {stats.get('cache_read_share_pct')}%, "
+            f"match {stats.get('decision_match_prod')}"
+        )
+    if summary.get("cross_variant_decision_agreement"):
+        parts.append(
+            f"cross-variant agreement {summary['cross_variant_decision_agreement']}"
+        )
+    return " · ".join(parts)[:400]
 
 
 def _cache_pct(row: dict[str, Any]) -> str:
@@ -147,6 +199,26 @@ def format_text(data: dict[str, Any]) -> str:
                 f"{row['source']:<22}{row['runs']:>6}{_fmt_usd(row['cost_usd']):>10}"
                 f"{row['completed']:>6}{row['not_relevant']:>8}{row['duplicate']:>5}{row['failed']:>6}"
             )
+        lines.append("")
+
+    if data.get("experiments"):
+        lines.append("EXPERIMENTS")
+        for row in data["experiments"]:
+            lines.append(
+                f"  [{row['status']:<7}] {row['name']} — {row['items']} items × "
+                f"{row['trials_per_item']} trial(s) ({row['dataset']})"
+            )
+            digest = experiment_digest(row["summary"])
+            if digest:
+                lines.append(f"            {digest}")
+        lines.append("")
+
+    if data.get("proposals"):
+        lines.append("PROPOSALS")
+        for row in data["proposals"]:
+            state = f" [{row['pr_state']}]" if row["pr_state"] else ""
+            url = f" {row['pr_url']}" if row["pr_url"] else ""
+            lines.append(f"  [{row['category']:<8}]{state} {row['patch_summary']}{url}")
         lines.append("")
 
     if data["findings"]:

@@ -18,7 +18,14 @@ from . import pricing, store
 logger = logging.getLogger(__name__)
 
 
-def wrap_anthropic(client: Any, *, kind: str, ref: Any = None, meta: dict[str, Any] | None = None) -> Any:
+def wrap_anthropic(
+    client: Any,
+    *,
+    kind: str,
+    ref: Any = None,
+    meta: dict[str, Any] | None = None,
+    mode: str = "normal",
+) -> Any:
     """Return the same client with messages.create instrumented. Never raises."""
     if not store.enabled():
         return client
@@ -46,13 +53,13 @@ def wrap_anthropic(client: Any, *, kind: str, ref: Any = None, meta: dict[str, A
             except BaseException as exc:
                 store.fire(
                     store.insert_run_complete(
-                        _run_row(kind, ref, meta, kwargs, None, exc, started, created_at)
+                        _run_row(kind, ref, meta, kwargs, None, exc, started, created_at, mode)
                     )
                 )
                 raise
             store.fire(
                 store.insert_run_complete(
-                    _run_row(kind, ref, meta, kwargs, response, None, started, created_at)
+                    _run_row(kind, ref, meta, kwargs, response, None, started, created_at, mode)
                 )
             )
             return response
@@ -73,6 +80,7 @@ def _run_row(
     error: BaseException | None,
     started: float,
     created_at: datetime,
+    mode: str = "normal",
 ) -> dict[str, Any]:
     duration_ms = int((time.monotonic() - started) * 1000)
     model = kwargs.get("model")
@@ -128,7 +136,7 @@ def _run_row(
         "agent_kind": kind,
         "external_ref": str(ref) if ref is not None else None,
         "attempt": 1,
-        "mode": "normal",
+        "mode": mode,
         "model": model,
         "status": "failed" if error is not None else "succeeded",
         "stop_subtype": stop_reason,

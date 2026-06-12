@@ -2,11 +2,24 @@
 
 **Production observability for [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview) apps — watch every agent run, score it, surface the waste.**
 
-Most teams running agents in production can't answer the most basic question about them: *what does one run cost?* The SDK hands back `total_cost_usd`, per-model token splits, cache stats and turn counts on every result message — and most pipelines iterate straight past it. stressless captures all of it with a few lines of integration, stores it in the Postgres you already run, and turns it into per-agent cost curves, deterministic quality checks, and a findings inbox.
+## The problem
 
-Extracted from a production deployment running 13 agent surfaces on one box.
+Agents in production leak money in ways nobody is watching: a "temporary" expensive-model fallback that becomes permanent, an agent retrying the same tool call with the same arguments, multi-turn runs paying full price because the prompt cache never hits, jobs creeping toward their budget cap. The Claude Agent SDK already reports everything needed to catch this — `total_cost_usd`, per-model token splits, cache stats and turn counts on every result message — and most pipelines iterate straight past it, so the evidence is dropped at the moment it's emitted.
 
-## What it does
+You *can* ship that stream to an observability platform (the SDK even exports OpenTelemetry), but the platforms want a backend stack (ClickHouse, Redis, S3), a proxy in front of your API traffic, or a SaaS vendor — at minimum another service to deploy and keep alive. And they stop at traces, dashboards and LLM-judge evals: spotting the waste in them is still your job.
+
+## The solution
+
+stressless is a small library, not a platform. It keeps the whole loop on infrastructure you already run and makes the waste-finding deterministic:
+
+1. **Capture** — wrap your SDK query stream once; every message passes through unchanged while tool calls, tokens, cache hits, turns and cost are recorded per run. A second wrapper covers raw `AsyncAnthropic` call sites.
+2. **Store** — fire-and-forget writes into a `stressless` schema in your existing Postgres. No proxy, no new service; it never blocks and never raises into the agent path.
+3. **Judge** — free, deterministic rule packs sweep recent runs for the known waste patterns: semantic tool loops, cache-cold runs, budget proximity, oversized tool outputs, tool-error clusters, model-routing waste. Recurring problems dedupe into Sentry-style **findings** with estimated dollar impact.
+4. **Report** — a terminal report and a single-file dashboard answer "what did today cost, per agent, and where's the waste?"
+
+Extracted from a production deployment running 13 agent surfaces on one box — where a prefilter pinned to an expensive model "temporarily" sat uninstrumented at ~3× the cost a small model could serve; exactly the kind of thing the rule packs now flag with a monthly-savings estimate.
+
+## What's inside
 
 - **Collector** — wrap your SDK query stream once and every run is recorded: tool calls/results as steps (sizes, latency, error flags), cost, cache hit ratio, turns, stop reason, session id. A second wrapper covers raw `AsyncAnthropic().messages.create` call sites with cache-aware cost estimation.
 - **TraceCards** — every finished run distills to a ~1.5 kB summary (model, turns, tokens, tools, flags, result preview) that downstream analysis reads instead of raw transcripts.

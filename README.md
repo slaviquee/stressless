@@ -71,7 +71,7 @@ app.include_router(stressless_router)   # GET /stressless
 
 - **Never blocks, never raises into the host.** All writes are fire-and-forget tasks on a dedicated 3-connection pool; payloads truncate client-side (full-payload SHA kept); storage failures log one throttled warning and drop the write. `STRESSLESS_ENABLED=0` is a hard kill switch.
 - **Runs on your infra.** A `stressless` schema in your existing Postgres. No vendor, no proxy, no new service.
-- **SDK-version safe.** Works against `claude-agent-sdk` 0.1.48+; newer `ResultMessage` fields (`model_usage`, `permission_denials`) are read via `getattr` and populate automatically after an SDK upgrade.
+- **SDK-version safe.** Works against `claude-agent-sdk` 0.1.48+; newer `ResultMessage` fields (`model_usage`, `permission_denials`, `stop_reason`, `errors`, `api_error_status`, `uuid`) are read via `getattr` and populate automatically after an SDK upgrade. Server-side tool calls (`ServerToolUseBlock`/`ServerToolResultBlock`, e.g. web search and web fetch) are recorded as steps just like client tool calls.
 - **Estimates are labeled.** SDK-reported `total_cost_usd` wins; token-derived costs are flagged `cost_estimated`.
 
 ## Configuration (env)

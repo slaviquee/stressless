@@ -1,8 +1,10 @@
 """Run capture: ambient run context, SDK stream tee, message → step parsing.
 
 Works against claude-agent-sdk >= 0.1.48. Newer ResultMessage fields
-(model_usage, permission_denials) are read defensively via getattr so the
-collector keeps working as the SDK evolves.
+(model_usage, permission_denials, stop_reason, errors, api_error_status,
+uuid) and server-side tool blocks (ServerToolUseBlock/ServerToolResultBlock)
+are read defensively via getattr so the collector keeps working as the SDK
+evolves.
 """
 
 from __future__ import annotations
@@ -40,6 +42,8 @@ _DICT_MESSAGE_TYPES = {
 _DICT_BLOCK_TYPES = {
     "tool_use": "ToolUseBlock",
     "tool_result": "ToolResultBlock",
+    "server_tool_use": "ServerToolUseBlock",
+    "server_tool_result": "ServerToolResultBlock",
     "text": "TextBlock",
     "thinking": "ThinkingBlock",
 }
@@ -76,6 +80,7 @@ class RunHandle:
         self.status = "running"
         self.outcome: str | None = None
         self.stop_subtype: str | None = None
+        self.stop_reason: str | None = None
         self.error: str | None = None
         self.num_turns: int | None = None
         self.duration_ms: int | None = None
@@ -127,7 +132,9 @@ class RunHandle:
             bname = _DICT_BLOCK_TYPES.get(str(block.get("type")), "")
         get = _getter(block)
 
-        if bname == "ToolUseBlock":
+        # Server-side tools (web_search/web_fetch, SDK 0.2.x) carry the same
+        # id/name/input and tool_use_id/content shapes as client tool blocks.
+        if bname in ("ToolUseBlock", "ServerToolUseBlock"):
             payload, sha, size = store.pack_payload(get("input"))
             tool_name = get("name") or "?"
             step = {
@@ -152,7 +159,7 @@ class RunHandle:
                 self._pending_tools[step["tool_use_id"]] = step
             self._tool_counts.setdefault(tool_name, [0, 0])[0] += 1
 
-        elif bname == "ToolResultBlock":
+        elif bname in ("ToolResultBlock", "ServerToolResultBlock"):
             tool_use_id = get("tool_use_id")
             payload, sha, size = store.pack_payload(get("content"))
             is_error = bool(get("is_error") or False)
@@ -276,6 +283,20 @@ class RunHandle:
         if denials:
             self.meta["permission_denials"] = store.pack_payload(denials)[0]
             self._flags.add("permission_denied")
+        # API-level stop_reason (end_turn/max_tokens/refusal/…) — kept apart
+        # from stop_subtype, which holds the SDK's run-level subtype.
+        self.stop_reason = get("stop_reason") or self.stop_reason
+        errors = get("errors")
+        if errors:
+            self.meta["errors"] = store.pack_payload(errors)[0]
+            self._flags.add("result_errors")
+        api_error_status = get("api_error_status")
+        if api_error_status is not None:
+            self.meta["api_error_status"] = api_error_status
+            self._flags.add(f"api_error:{api_error_status}")
+        result_uuid = get("uuid")
+        if result_uuid is not None:
+            self.meta["result_uuid"] = str(result_uuid)
 
         result = get("result")
         if isinstance(result, str) and result:
@@ -320,6 +341,7 @@ class RunHandle:
             "status": self.status,
             "outcome": self.outcome,
             "stop": self.stop_subtype,
+            "stop_reason": self.stop_reason,
             "model": self.model,
             "turns": self.num_turns,
             "wall_ms": self.duration_ms,

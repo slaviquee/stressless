@@ -90,6 +90,86 @@ def test_run_handle_observes_dict_messages() -> None:
     assert tool_steps[0]["output"] == "no match"
 
 
+def test_run_handle_captures_new_result_fields() -> None:
+    """SDK 0.2.x ResultMessage fields land in meta/tracecard without touching 0.1.48 ones."""
+    handle = RunHandle("item_processor")
+    handle.observe_message(
+        {
+            "type": "result",
+            "subtype": "success",
+            "stop_reason": "max_tokens",
+            "errors": ["overloaded_error: retried 2x"],
+            "api_error_status": 529,
+            "uuid": "res-uuid-1",
+            "usage": {"input_tokens": 5, "output_tokens": 5},
+        }
+    )
+    handle.finish()
+
+    assert handle.status == "succeeded"
+    assert handle.stop_subtype == "success"  # unchanged by stop_reason
+    assert handle.stop_reason == "max_tokens"
+    assert handle.meta["errors"] == ["overloaded_error: retried 2x"]
+    assert handle.meta["api_error_status"] == 529
+    assert handle.meta["result_uuid"] == "res-uuid-1"
+
+    card = handle.build_tracecard()
+    assert card["stop"] == "success"
+    assert card["stop_reason"] == "max_tokens"
+    assert "result_errors" in card["flags"]
+    assert "api_error:529" in card["flags"]
+
+
+def test_run_handle_old_sdk_result_stays_null() -> None:
+    """0.1.48-shaped results (no new fields) behave exactly as before."""
+    handle = RunHandle("lens")
+    handle.observe_message({"type": "result", "subtype": "success", "num_turns": 1})
+    handle.finish()
+
+    assert handle.status == "succeeded"
+    assert handle.stop_reason is None
+    assert "errors" not in handle.meta
+    assert "api_error_status" not in handle.meta
+    assert "result_uuid" not in handle.meta
+
+    card = handle.build_tracecard()
+    assert "stop_reason" not in card
+    assert "flags" not in card
+
+
+def test_run_handle_observes_server_tool_blocks() -> None:
+    """Server-side web_search/web_fetch blocks (SDK 0.2.x) become tool steps."""
+    handle = RunHandle("researcher")
+    handle.observe_message(
+        {
+            "type": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "srv1",
+                    "name": "web_search",
+                    "input": {"query": "acme funding"},
+                },
+                {
+                    "type": "server_tool_result",
+                    "tool_use_id": "srv1",
+                    "content": [{"title": "Acme raises"}],
+                },
+            ],
+        }
+    )
+    handle.finish()
+
+    tool_steps = [s for s in handle.steps if s["kind"] == "tool"]
+    assert len(tool_steps) == 1
+    assert tool_steps[0]["name"] == "web_search"
+    assert tool_steps[0]["input"] == {"query": "acme funding"}
+    assert tool_steps[0]["output"] == [{"title": "Acme raises"}]
+    assert tool_steps[0]["is_error"] is False
+    assert handle.build_tracecard()["tools"] == {"web_search": 1}
+
+
 def test_run_handle_prefers_reported_cost() -> None:
     handle = RunHandle("lens")
     handle.observe_message(
